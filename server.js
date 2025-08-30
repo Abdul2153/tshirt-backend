@@ -11,7 +11,7 @@ const PORT = 3000;
 const JWT_SECRET = process.env.JWT_SECRET; // Replace with a long, random string
 
 // --- Middleware ---
-const corsOptions = { origin: 'http://127.0.0.1:5500', optionsSuccessStatus: 200 };
+const corsOptions = { origin: 'https://printastic-tshirt.netlify.app', optionsSuccessStatus: 200 };
 app.use(cors(corsOptions));
 app.use(express.json());
 
@@ -219,4 +219,5 @@ app.get('/my-orders', authMiddleware, async (req, res) => {
 // Start the server
 app.listen(PORT, () => {
     console.log(`Server is running beautifully on http://localhost:${PORT}`);
+
 });
