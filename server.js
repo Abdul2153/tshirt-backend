@@ -10,6 +10,11 @@ const app = express();
 const PORT = 3000;
 const JWT_SECRET = process.env.JWT_SECRET; // Replace with a long, random string
 
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
+
+
 // --- Middleware ---
 const corsOptions = { origin: 'https://printastic-tshirt.netlify.app', optionsSuccessStatus: 200 };
 app.use(cors(corsOptions));
@@ -33,12 +38,14 @@ const User = mongoose.model('User', UserSchema);
 // NEW: Order Schema to store purchase details
 const OrderSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    customerName: { type: String, required: true },
     products: { type: Array, required: true },
     totalAmount: { type: Number, required: true },
     shippingAddress: { type: String, required: true },
     razorpayOrderId: { type: String, required: true },
     razorpayPaymentId: { type: String },
     paymentStatus: { type: String, default: 'Pending' },
+    orderStatus: { type: String, default: 'Ongoing' },
     orderDate: { type: Date, default: Date.now }
 });
 const Order = mongoose.model('Order', OrderSchema);
@@ -63,6 +70,24 @@ const authMiddleware = (req, res, next) => {
         res.status(401).json({ message: 'Token is not valid.' });
     }
 };
+
+// NEW: Configure Cloudinary using Environment Variables
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// NEW: Configure Multer to use Cloudinary for storage
+const storage = new CloudinaryStorage({
+    cloudinary: cloudinary,
+    params: {
+        folder: 'tshirt-designs', // A folder name in your Cloudinary account
+        format: async (req, file) => 'png', // supports promises as well
+        public_id: (req, file) => `design-${Date.now()}`,
+    },
+});
+const upload = multer({ storage: storage });
 
 // --- API ROUTES ---
 
@@ -110,7 +135,7 @@ app.post('/login', async (req, res) => {
         }
         // If credentials are correct, create a login token (optional but good practice)
         const payload = { user: { id: user.id } };
-        const token = jwt.sign(payload, 'yourSuperSecretKey123', { expiresIn: '1h' }); // Replace 'yourSecretKey'
+        const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1d' }); // Replace 'yourSecretKey'
         res.json({ message: 'Login successful!', token, user: { id: user.id, name: user.name, email: user.email } });
     } catch (error) {
         console.error('Login error:', error);
@@ -118,53 +143,61 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// NEW: Route to get a single user's details by their ID
-app.get('/user/:id', async (req, res) => {
+// Route to get a single user's details by their ID
+app.get('/user/:id', authMiddleware, async (req, res) => {
     try {
-        // Find user by the ID provided in the URL, and exclude their password from the response
+        // Check if the requested ID matches the ID from the user's token
+        if (req.params.id !== req.user.id) {
+            return res.status(403).json({ message: 'User not authorized.' });
+        }
+
         const user = await User.findById(req.params.id).select('-password'); 
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
-        res.json(user); // Send the user's details back
+        res.json(user);
     } catch (error) {
         console.error('Get user error:', error);
         res.status(500).send('Server error');
     }
 });
 
-// UPDATED: /create-order route
-app.post('/create-order', async (req, res) => {
+// CORRECTED /create-order route
+// In server.js
+app.post('/create-order', authMiddleware, async (req, res) => {
     try {
-        const { cart, userId, address } = req.body;
+        const { cart, address, userName } = req.body;
         if (!cart || cart.length === 0) return res.status(400).send('Cart is empty');
 
         let totalAmount = 0;
         cart.forEach(item => { totalAmount += parseFloat(item.price); });
 
-        const productNames = cart.map(item => item.name).join(', ');
+        // CORRECTED: This now saves all product details, including the custom URL for each item
+        const formattedProducts = cart.map(item => ({
+            name: item.name,
+            price: item.price,
+            image: item.image,
+            customDesignUrl: item.customDesignUrl || null
+        }));
 
-        const razorpayOptions = {
+        const razorpayOrder = await razorpay.orders.create({
             amount: totalAmount * 100,
             currency: 'INR',
             receipt: `receipt_order_${new Date().getTime()}`,
-            notes: { items: productNames, userId: userId }
-        };
-        
-        const razorpayOrder = await razorpay.orders.create(razorpayOptions);
+            notes: { items: cart.map(item => item.name).join(', ') }
+        });
         if (!razorpayOrder) return res.status(500).send('Error creating Razorpay order');
 
-        // Create a 'Pending' order in our database
         const newOrder = new Order({
-            userId: userId,
-            products: cart,
+            userId: req.user.id,
+            customerName: userName,
+            products: formattedProducts, // Use the new, complete product list
             totalAmount: totalAmount,
             shippingAddress: address,
             razorpayOrderId: razorpayOrder.id,
             paymentStatus: 'Pending'
         });
         await newOrder.save();
-
         res.json(razorpayOrder);
     } catch (error) {
         console.error('Create order error:', error);
@@ -180,7 +213,7 @@ app.post('/verify-payment', async (req, res) => {
         // This is a security step from Razorpay's docs
         const body = razorpay_order_id + "|" + razorpay_payment_id;
         const expectedSignature = crypto
-            .createHmac('sha256', 'n81NhMKGxhJlBduft9mDU4CU') // Use your Key Secret
+            .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET) // Use your Key Secret
             .update(body.toString())
             .digest('hex');
 
@@ -216,8 +249,50 @@ app.get('/my-orders', authMiddleware, async (req, res) => {
     }
 });
 
+// NEW: Route to handle image uploads
+app.post('/upload-design', upload.single('design'), (req, res) => {
+    // 'design' is the name of the input field in the HTML form
+    if (!req.file) {
+        return res.status(400).json({ message: 'No file uploaded.' });
+    }
+    // Multer and Cloudinary have handled the upload.
+    // req.file.path contains the secure URL of the uploaded image.
+    res.json({ imageUrl: req.file.path });
+});
+
+// --- ADMIN ROUTES ---
+
+// 1. A route to get all orders
+app.get('/admin/orders', async (req, res) => {
+    try {
+        // UPDATED: .populate() will now automatically include the name and email
+        // of the user associated with each order.
+        const orders = await Order.find({ paymentStatus: 'Paid' })
+            .populate('userId', 'name email') // This "joins" the user data
+            .sort({ orderDate: -1 });
+        res.json(orders);
+    } catch (error) {
+        console.error('Admin get orders error:', error);
+        res.status(500).send('Server Error');
+    }
+});
+
+// 2. A route to mark an order as "Completed"
+app.post('/admin/orders/:id/complete', async (req, res) => {
+    try {
+        const order = await Order.findByIdAndUpdate(
+            req.params.id,
+            { orderStatus: 'Completed' },
+            { new: true }
+        );
+        res.json(order);
+    } catch (error) {
+        console.error('Admin update order error:', error);
+        res.status(500).send('Server Error');
+    }
+});
+
 // Start the server
 app.listen(PORT, () => {
     console.log(`Server is running beautifully on http://localhost:${PORT}`);
-
 });
